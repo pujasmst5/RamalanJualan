@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peramalan Pendapatan Harian E-Commerce</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --ink: #1d2b2a;
+    --muted: #5c6b69;
+    --line: #d9dedc;
+    --accent: #0f6b66;
+    --warn: #b4541a;
+    --surface: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141b1a;
+      --ink: #e6ecea;
+      --muted: #9aaaa7;
+      --line: #2c3836;
+      --accent: #4cc2ba;
+      --warn: #e6934f;
+      --surface: #1b2423;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: Georgia, "Times New Roman", serif; line-height: 1.6;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 6px; }
+  h2 { font-size: 1.2rem; margin: 44px 0 8px; padding-top: 18px; border-top: 1px solid var(--line); }
+  p.lede { color: var(--muted); margin: 0 0 8px; max-width: 70ch; }
+  p.note { color: var(--muted); font-size: .92rem; max-width: 70ch; }
+  .sans, table, button, select, label { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; margin-top: 12px; }
+  th, td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  tr.best td { font-weight: 600; color: var(--accent); }
+  .chart-wrap { position: relative; height: 320px; margin-top: 12px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+  select, button {
+    font-size: .95rem; padding: 8px 12px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink); border-radius: 4px;
+  }
+  button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+  button:hover { filter: brightness(1.08); }
+  button:focus-visible, select:focus-visible { outline: 3px solid var(--warn); outline-offset: 2px; }
+  #status { color: var(--muted); font-size: .92rem; font-family: system-ui, sans-serif; }
+  #status.error { color: var(--warn); }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Peramalan pendapatan harian e-commerce</h1>
+  <p class="lede">
+    Model LSTM memakai pendapatan {{ meta.timesteps }} hari terakhir untuk memperkirakan pendapatan hari berikutnya.
+    Data terakhir tercatat pada {{ meta.last_date }}.
+  </p>
+
+  <h2>Hasil peramalan</h2>
+  <div class="controls">
+    <label for="days">Jumlah hari ke depan</label>
+    <select id="days">
+      <option value="7" selected>7 hari</option>
+      <option value="10">10 hari</option>
+      <option value="14">14 hari</option>
+      <option value="20">20 hari</option>
+      <option value="30">30 hari</option>
+    </select>
+    <button id="run" type="button">Buat ramalan</button>
+    <span id="status" role="status" aria-live="polite"></span>
+  </div>
+  <div class="chart-wrap"><canvas id="forecastChart" aria-label="Grafik peramalan"></canvas></div>
+  <p class="note">
+    Ramalan beberapa hari dibuat bertahap: hasil hari pertama dipakai sebagai masukan hari kedua, dan seterusnya,
+    sehingga galat bisa menumpuk. Makin jauh harinya, makin kurang bisa diandalkan.
+  </p>
+  <div class="scroll"><table id="forecastTable" hidden>
+    <thead><tr><th>Tanggal</th><th>Prediksi pendapatan</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+
+  <h2>Data historis</h2>
+  <p class="lede">Pendapatan harian dari seluruh pesanan. Hari tanpa pesanan dihitung 0.</p>
+  <div class="chart-wrap"><canvas id="historyChart" aria-label="Grafik pendapatan historis"></canvas></div>
+
+  <h2>Kinerja pada data uji</h2>
+  <p class="lede" id="testPeriod"></p>
+  <div class="chart-wrap"><canvas id="testChart" aria-label="Grafik aktual dan prediksi pada data uji"></canvas></div>
+
+  <h2>Perbandingan dengan metode sederhana</h2>
+  <p class="note">
+    Model dianggap berguna jika galatnya lebih kecil daripada tebakan sederhana. Baris terbaik (RMSE terendah) ditandai.
+  </p>
+  <div class="scroll"><table id="metricsTable">
+    <thead><tr><th>Metode</th><th>MAE</th><th>MSE</th><th>RMSE</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+</main>
+
+<script>
+const fmt = new Intl.NumberFormat("id-ID", { maximumFractionDigits: 2 });
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const charts = {};
+
+function lineChart(id, labels, datasets) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: "index", intersect: false },
+      elements: { point: { radius: 0, hitRadius: 8 } },
+      scales: {
+        x: { ticks: { maxTicksLimit: 8, color: css("--muted") }, grid: { color: css("--line") } },
+        y: { ticks: { color: css("--muted"), callback: v => fmt.format(v) }, grid: { color: css("--line") } }
+      },
+      plugins: {
+        legend: { labels: { color: css("--ink") } },
+        tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmt.format(c.parsed.y)}` } }
+      }
+    }
+  });
+}
+
+async function loadData() {
+  const res = await fetch("/api/data");
+  const d = await res.json();
+
+  lineChart("historyChart", d.history.dates, [
+    { label: "Pendapatan harian", data: d.history.revenue, borderColor: css("--accent"), borderWidth: 1 }
+  ]);
+
+  document.getElementById("testPeriod").textContent =
+    `Periode uji ${d.test_period[0]} sampai ${d.test_period[1]}, tidak dipakai saat pelatihan.`;
+  lineChart("testChart", d.test.dates, [
+    { label: "Aktual", data: d.test.actual, borderColor: css("--muted"), borderWidth: 1.2 },
+    { label: "Prediksi LSTM", data: d.test.predicted, borderColor: css("--warn"), borderWidth: 1.8 }
+  ]);
+
+  const rows = Object.assign({}, d.baselines);
+  rows["LSTM"] = d.metrics;
+  const sorted = Object.entries(rows).sort((a, b) => a[1].RMSE - b[1].RMSE);
+  const tbody = document.querySelector("#metricsTable tbody");
+  tbody.innerHTML = "";
+  sorted.forEach(([name, m], i) => {
+    const tr = document.createElement("tr");
+    if (i === 0) tr.className = "best";
+    tr.innerHTML = `<td>${name}</td><td>${fmt.format(m.MAE)}</td><td>${fmt.format(m.MSE)}</td><td>${fmt.format(m.RMSE)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function runForecast() {
+  const status = document.getElementById("status");
+  const btn = document.getElementById("run");
+  const days = document.getElementById("days").value;
+  status.className = ""; status.textContent = "Menghitung ramalan...";
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/forecast?days=${days}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || "Permintaan gagal.");
+
+    lineChart("forecastChart", d.dates, [
+      { label: "Prediksi pendapatan", data: d.predicted, borderColor: css("--accent"), borderWidth: 2,
+        pointRadius: 3, backgroundColor: css("--accent") }
+    ]);
+
+    const table = document.getElementById("forecastTable");
+    const tbody = table.querySelector("tbody");
+    tbody.innerHTML = "";
+    d.dates.forEach((dt, i) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${dt}</td><td>${fmt.format(d.predicted[i])}</td>`;
+      tbody.appendChild(tr);
+    });
+    table.hidden = false;
+    status.textContent = `Ramalan ${days} hari setelah ${d.last_data_date}.`;
+  } catch (err) {
+    status.className = "error";
+    status.textContent = "Gagal membuat ramalan: " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("run").addEventListener("click", runForecast);
+loadData().then(runForecast).catch(e => {
+  const s = document.getElementById("status");
+  s.className = "error"; s.textContent = "Gagal memuat data: " + e.message;
+});
+</script>
+</body>
+</html>
